@@ -26,6 +26,144 @@ assert (hello_pkt[PIMv2Hello].option[3][PIMv2HelloGenerationID].type == 20)
 
 repr(PIMv2HelloLANPruneDelayValue(t=1))
 
+= PIMv2 Register - IPv4 build and dissection
+
+# RFC 7761 section 4.9.3: the checksum covers the eight-byte PIM header.
+register4_data = bytes.fromhex(
+    "2100deff00000000"
+    "45000020000100003f116093c6336401ef010203"
+    "03e807d0000c000074657374"
+)
+register4 = (IP(src="192.0.2.1", dst="192.0.2.2") /
+             PIMv2Hdr() / PIMv2Register() /
+             IP(src="198.51.100.1", dst="239.1.2.3", ttl=63) /
+             UDP(sport=1000, dport=2000, chksum=0) / b"test")
+assert raw(register4.payload) == register4_data
+decoded4 = IP(raw(register4))
+assert decoded4.proto == 103
+assert decoded4[PIMv2Hdr].type == 1
+assert decoded4[PIMv2Register].border == 0
+assert decoded4[PIMv2Register].null == 0
+assert decoded4[PIMv2Register].payload.src == "198.51.100.1"
+assert decoded4[PIMv2Register].payload.dst == "239.1.2.3"
+assert decoded4[UDP].dport == 2000
+assert raw(decoded4[UDP].payload) == b"test"
+assert raw(decoded4.payload) == register4_data
+
+= PIMv2 Register - IPv6 build and dissection
+
+# The IPv6 pseudo-header length is also eight, not the full message length.
+register6_data = bytes.fromhex(
+    "2100831b00000000"
+    "60000000000c113f20010db8000000000000000000000001"
+    "ff3e0000000000000000000000001234"
+    "03e807d0000ccd1774657374"
+)
+register6 = (IPv6(src="2001:db8::1", dst="2001:db8::2") /
+             PIMv2Hdr() / PIMv2Register() /
+             IPv6(src="2001:db8::1", dst="ff3e::1234", hlim=63) /
+             UDP(sport=1000, dport=2000) / b"test")
+assert raw(register6.payload) == register6_data
+decoded6 = IPv6(raw(register6))
+assert decoded6.nh == 103
+assert decoded6[PIMv2Hdr].type == 1
+assert isinstance(decoded6[PIMv2Register].payload, IPv6)
+assert decoded6[PIMv2Register].payload.dst == "ff3e::1234"
+assert decoded6[UDP].dport == 2000
+assert raw(decoded6.payload) == register6_data
+
+= PIMv2 Register - checksum excludes the multicast packet
+
+for outer, expected in [
+    (IP(src="192.0.2.1", dst="192.0.2.2"), b"\xde\xff"),
+    (IPv6(src="2001:db8::1", dst="2001:db8::2"), b"\x83\x1b"),
+    (IPv6(src="2001:db8::1", dst="2001:db8::2") / IPv6ExtHdrHopByHop(), b"\x83\x1b"),
+]:
+    for payload in [b"", b"x", b"a longer payload"]:
+        packet = outer / PIMv2Hdr() / PIMv2Register() / Raw(payload)
+        encoded = raw(packet[PIMv2Hdr])
+        assert encoded[2:4] == expected
+        assert encoded[8:] == payload
+
+= PIMv2 Register - explicit checksum is preserved
+
+for chksum in [0, 0x1234]:
+    for packet in [register4, register6]:
+        packet = packet.copy()
+        packet[PIMv2Hdr].chksum = chksum
+        assert PIMv2Hdr(raw(packet[PIMv2Hdr])).chksum == chksum
+
+= PIMv2 Register - border and null flags
+
+for border, null, first_byte in [(0, 0, 0), (1, 0, 0x80), (0, 1, 0x40), (1, 1, 0xc0)]:
+    packet = PIMv2Register(border=border, null=null)
+    assert raw(packet) == bytes([first_byte, 0, 0, 0])
+    decoded = PIMv2Register(raw(packet))
+    assert decoded.border == border
+    assert decoded.null == null
+    assert decoded.reserved == 0
+
+= PIMv2 Null-Register - dummy IPv4 and IPv6 headers
+
+for outer, inner in [
+    (IP(src="192.0.2.1", dst="192.0.2.2"),
+     IP(src="198.51.100.1", dst="239.1.2.3", proto=103)),
+    (IPv6(src="2001:db8::1", dst="2001:db8::2"),
+     IPv6(src="2001:db8::1", dst="ff3e::1234") / PIMv2Hdr(version=0)),
+]:
+    packet = outer / PIMv2Hdr() / PIMv2Register(null=1) / inner
+    decoded = outer.__class__(raw(packet))
+    assert decoded[PIMv2Register].null == 1
+    assert isinstance(decoded[PIMv2Register].payload, outer.__class__)
+    assert raw(decoded[PIMv2Register].payload) == raw(inner)
+
+= PIMv2 Register - unknown payload version remains raw
+
+packet = PIMv2Register(b"\x00\x00\x00\x00\x70\x01")
+assert isinstance(packet.payload, Raw)
+assert raw(packet.payload) == b"\x70\x01"
+assert not PIMv2Register(b"\x00\x00\x00\x00").payload
+
+= PIMv2 Register-Stop - IPv4 build and dissection
+
+stop4_data = bytes.fromhex("2200c0a501000020ef0102030100c6336401")
+stop4 = (IP(src="192.0.2.1", dst="192.0.2.2") / PIMv2Hdr() /
+         PIMv2RegisterStop(group="239.1.2.3", source="198.51.100.1"))
+assert raw(stop4.payload) == stop4_data
+decoded = IP(raw(stop4))
+assert decoded[PIMv2Hdr].type == 2
+assert decoded[PIMv2RegisterStop].group == "239.1.2.3"
+assert decoded[PIMv2RegisterStop].source == "198.51.100.1"
+assert decoded[PIMv2RegisterStop].mask_len == 32
+assert raw(decoded.payload) == stop4_data
+
+= PIMv2 Register-Stop - IPv6 build and dissection
+
+stop6_data = bytes.fromhex(
+    "22003e4c02000080ff3e0000000000000000000000001234"
+    "020020010db8000000000000000000000001"
+)
+stop6 = (IPv6(src="2001:db8::1", dst="2001:db8::2") / PIMv2Hdr() /
+         PIMv2RegisterStop(group_addr_family=2, group="ff3e::1234",
+                           source_addr_family=2, source="2001:db8::1"))
+assert raw(stop6.payload) == stop6_data
+decoded = IPv6(raw(stop6))
+assert decoded[PIMv2Hdr].type == 2
+assert decoded[PIMv2RegisterStop].group == "ff3e::1234"
+assert decoded[PIMv2RegisterStop].source == "2001:db8::1"
+assert decoded[PIMv2RegisterStop].mask_len == 128
+assert raw(decoded.payload) == stop6_data
+
+= PIMv2 Register-Stop - wildcard source and explicit group mask
+
+for family, group, source, mask in [(1, "239.1.2.0", "0.0.0.0", 24), (2, "ff3e::", "::", 64)]:
+    packet = PIMv2RegisterStop(group_addr_family=family, group=group,
+                               source_addr_family=family, mask_len=mask)
+    decoded = PIMv2RegisterStop(raw(packet))
+    assert decoded.source == source
+    assert decoded.group == group
+    assert decoded.mask_len == mask
+
 = PIMv2 Join/Prune - instantiation
 
 jp_data = b'\x01\x00^\x00\x00\r\x00\xd0\xcb\x00\xba\xe4\x08\x00E\xc0\x00rY\xfb\x00\x00\x01gT3\x15\x15\x15\x15\xe0\x00\x00\r#\x00\x1b\x18\x01\x00\x15\x15\x15\x16\x00\x04\x00\xd2\x01\x00\x00 \xef\x01\x01\x0b\x00\x01\x00\x00\x01\x00\x07 \x16\x16\x16\x15\x01\x00\x00 \xef\x01\x01\x0c\x00\x01\x00\x00\x01\x00\x07 \x16\x16\x16\x15\x01\x00\x00 \xef\x01\x01\x0b\x00\x00\x00\x01\x01\x00\x07 \x16\x16\x16\x15\x01\x00\x00 \xef\x01\x01\x0c\x00\x00\x00\x01\x01\x00\x07 \x16\x16\x16\x15'
@@ -271,5 +409,4 @@ prune_pkt6 = Ether(dst='33:33:00:00:00:0d', src='02:00:00:00:00:01')/ \
 
 
 assert raw(prune_pkt6) == jp_data6prune
-
 

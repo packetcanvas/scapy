@@ -7,6 +7,7 @@
 """
 References:
   - https://tools.ietf.org/html/rfc4601
+  - https://www.rfc-editor.org/rfc/rfc7761.html
   - https://www.iana.org/assignments/pim-parameters/pim-parameters.xhtml
 """
 import struct
@@ -53,8 +54,10 @@ class PIMv2Hdr(Packet):
         """
         p += pay
         if self.chksum is None:
+            # RFC 7761, section 4.9: Register excludes the encapsulated packet.
+            checksum_data = p[:8] if self.type == 1 else p
             if isinstance(self.underlayer, IP):
-                ck = checksum(p)
+                ck = checksum(checksum_data)
                 # ck = in4_chksum(103, self.underlayer, p)
                 # According to RFC768 if the result checksum is 0, it should be set to 0xFFFF  # noqa: E501
                 if ck == 0:
@@ -62,7 +65,7 @@ class PIMv2Hdr(Packet):
                 p = p[:2] + struct.pack("!H", ck) + p[4:]
 
             elif isinstance(self.underlayer, IPv6) or isinstance(self.underlayer, _IPv6ExtHdr):  # noqa: E501
-                ck = in6_chksum(103, self.underlayer, p)  # noqa: E501
+                ck = in6_chksum(103, self.underlayer, checksum_data)
                 # According to RFC2460 if the result checksum is 0, it should be set to 0xFFFF  # noqa: E501
                 if ck == 0:
                     ck = 0xFFFF
@@ -216,6 +219,52 @@ PIMv2_HELLO_CLASSES = {
 
 
 ##################################
+# PIMv2 Register / Register-Stop
+##################################
+class PIMv2Register(Packet):
+    name = "PIMv2 Register"
+    fields_desc = [
+        BitField("border", 0, 1),
+        BitField("null", 0, 1),
+        BitField("reserved", 0, 30),
+    ]
+
+    def guess_payload_class(self, payload):
+        if payload:
+            version = payload[0] >> 4
+            if version == 4:
+                return IP
+            elif version == 6:
+                return IPv6
+        return Packet.guess_payload_class(self, payload)
+
+
+class PIMv2RegisterStop(Packet):
+    name = "PIMv2 Register-Stop"
+    fields_desc = [
+        ByteField("group_addr_family", 1),
+        ByteField("group_encoding_type", 0),
+        BitField("bidirection", 0, 1),
+        BitField("reserved", 0, 6),
+        BitField("admin_scope_zone", 0, 1),
+        FieldLenField("mask_len", None, length_of="group", fmt="B",
+                      adjust=lambda pkt, length: length * 8),
+        MultipleTypeField(
+            [(IP6Field("group", "::"),
+              lambda pkt: pkt.group_addr_family == 2)],
+            IPField("group", "0.0.0.0")
+        ),
+        ByteField("source_addr_family", 1),
+        ByteField("source_encoding_type", 0),
+        MultipleTypeField(
+            [(IP6Field("source", "::"),
+              lambda pkt: pkt.source_addr_family == 2)],
+            IPField("source", "0.0.0.0")
+        ),
+    ]
+
+
+##################################
 # PIMv2 Join/Prune
 ##################################
 class PIMv2JoinPruneAddrsBase(_PIMGenericTlvBase):
@@ -288,4 +337,6 @@ class PIMv2JoinPrune(_PIMGenericTlvBase):
 bind_layers(IP, PIMv2Hdr, proto=103)
 bind_layers(IPv6, PIMv2Hdr, nh=103)
 bind_layers(PIMv2Hdr, PIMv2Hello, type=0)
+bind_layers(PIMv2Hdr, PIMv2Register, type=1)
+bind_layers(PIMv2Hdr, PIMv2RegisterStop, type=2)
 bind_layers(PIMv2Hdr, PIMv2JoinPrune, type=3)
